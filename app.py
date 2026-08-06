@@ -1,15 +1,21 @@
 import subprocess
 import sys
 import time
+import io
+from datetime import datetime
 from urllib.parse import urlparse
 import pandas as pd
 import streamlit as st
 from playwright.sync_api import sync_playwright
 
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend required for headless server environments
+import matplotlib.pyplot as plt
+
 # --- Streamlit Cloud Auto-Installation ---
 @st.cache_resource
 def setup_playwright():
-    """Installs Chromium binary on app launch (OS dependencies handled by packages.txt)."""
+    """Installs Chromium binary on app launch."""
     try:
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
     except Exception as e:
@@ -31,11 +37,66 @@ def clean_url(url):
     return f"{netloc}{path}"
 
 
+def generate_proof_image(results):
+    """Generates a styled PNG image summary card as downloadable proof of checking."""
+    total = len(results)
+    orphans = sum(1 for r in results if r["is_orphan"] == "Yes")
+    linked = total - orphans
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # Set up canvas
+    fig, ax = plt.subplots(figsize=(10, max(4, len(results) * 0.5 + 2.5)), dpi=150)
+    ax.axis('off')
+
+    # Header & Timestamp
+    fig.text(0.05, 0.93, "Orphan Page Audit Proof", fontsize=18, fontweight='bold', color='#0F172A')
+    fig.text(0.05, 0.88, f"Verified On: {timestamp}", fontsize=9, color='#64748B')
+
+    # KPI Banner
+    banner_text = f"Total Checked: {total}  |  Orphan Pages: {orphans}  |  Linked Pages: {linked}"
+    fig.text(0.05, 0.81, banner_text, fontsize=11, fontweight='bold', color='#1E293B',
+             bbox=dict(boxstyle="round,pad=0.5", facecolor="#F1F5F9", edgecolor="#CBD5E1"))
+
+    # Table Formatting
+    table_data = [["Target URL", "Orphan Status", "Inbound Links"]]
+    for r in results:
+        display_url = r["target_url"] if len(r["target_url"]) < 55 else r["target_url"][:52] + "..."
+        table_data.append([display_url, r["is_orphan"], str(r["inbound_count"])])
+
+    table = ax.table(cellText=table_data, loc='center', cellLoc='left', colWidths=[0.62, 0.20, 0.18])
+    table.auto_set_font_size(False)
+    table.set_fontsize(9.5)
+    table.scale(1, 1.8)
+
+    # Cell Styling & Badges
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_facecolor('#0F172A')
+            cell.set_text_props(color='white', fontweight='bold')
+        else:
+            if col == 1:
+                is_orphan_val = table_data[row][1]
+                if is_orphan_val == "Yes":
+                    cell.set_facecolor('#FEE2E2')
+                    cell.set_text_props(color='#991B1B', fontweight='bold')
+                else:
+                    cell.set_facecolor('#DCFCE7')
+                    cell.set_text_props(color='#166534', fontweight='bold')
+            else:
+                cell.set_facecolor('#FFFFFF' if row % 2 == 0 else '#F8FAFC')
+
+    plt.tight_layout()
+
+    # Save to buffer
+    img_buffer = io.BytesIO()
+    plt.savefig(img_buffer, format='png', bbox_inches='tight', dpi=150)
+    plt.close(fig)
+    img_buffer.seek(0)
+    return img_buffer
+
+
 def crawl_with_playwright(target_urls, source_urls):
-    """
-    Launches a Chromium browser via Playwright to render JavaScript DOM,
-    extract internal links, and match them against target URLs.
-    """
+    """Launches Chromium via Playwright to extract JavaScript DOM links."""
     target_map = {clean_url(u): u.strip() for u in target_urls if u.strip()}
     target_cleans = set(target_map.keys())
 
@@ -47,7 +108,6 @@ def crawl_with_playwright(target_urls, source_urls):
     total_sources = len(source_urls)
 
     with sync_playwright() as p:
-        # Container-friendly launch flags required for Streamlit Cloud
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -137,7 +197,7 @@ def crawl_with_playwright(target_urls, source_urls):
     return results, audit_logs
 
 
-# --- Streamlit UI Config & Layout ---
+# --- Streamlit UI Layout ---
 st.set_page_config(page_title="Orphan Page Checker", layout="wide")
 st.title("🌐 Real-Browser (Playwright) Orphan Checker")
 st.caption("Renders full JavaScript DOM in Chromium to reliably detect dynamic internal links.")
@@ -188,6 +248,19 @@ if st.button("Run Orphan Check", type="primary"):
                 ])
                 st.dataframe(df, use_container_width=True)
 
+                # --- Proof Image Export ---
+                proof_img_buf = generate_proof_image(results)
+                
+                c_left, c_right = st.columns([1, 2])
+                with c_left:
+                    st.download_button(
+                        label="📷 Download Proof Image (PNG)",
+                        data=proof_img_buf,
+                        file_name=f"orphan_audit_proof_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png",
+                        mime="image/png",
+                        type="secondary"
+                    )
+
                 st.markdown("### Inbound Link Evidence")
                 for item in results:
                     if item["is_orphan"] == "No":
@@ -207,5 +280,4 @@ if st.button("Run Orphan Check", type="primary"):
                     st.dataframe(pd.DataFrame(audit_logs), use_container_width=True)
 
             except Exception as err:
-                st.error(f"Chromium Launch Error: {err}")
-                st.info("If this is your first deploy after adding packages.txt, please Reboot your app from the Streamlit Cloud menu.")
+                st.error(f"Execution Error: {err}")
