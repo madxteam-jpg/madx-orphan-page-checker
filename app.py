@@ -1,19 +1,27 @@
-import streamlit as st
-from playwright.sync_api import sync_playwright
-from urllib.parse import urlparse
-import pandas as pd
-import time
 import subprocess
 import sys
+import time
+from urllib.parse import urlparse
+import pandas as pd
+import streamlit as st
+from playwright.sync_api import sync_playwright
 
-# Auto-install Playwright chromium binaries on cloud boot
-try:
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-except Exception as e:
-    print(f"Playwright installation warning: {e}")
+# --- Streamlit Cloud Auto-Installation ---
+@st.cache_resource
+def setup_playwright():
+    """Ensure Playwright Chromium browser and system dependencies are installed on Cloud boot."""
+    try:
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"], check=True)
+    except Exception as e:
+        print(f"Playwright setup info: {e}")
+
+# Run setup at application launch
+setup_playwright()
+
 
 def clean_url(url):
-    """Normalizes URLs by stripping protocol, www, trailing slashes, and parameters."""
+    """Normalizes URLs by stripping protocol, www, trailing slashes, and query params."""
     if not url:
         return ""
     url = url.strip()
@@ -24,10 +32,11 @@ def clean_url(url):
     path = parsed.path.rstrip('/')
     return f"{netloc}{path}"
 
+
 def crawl_with_playwright(target_urls, source_urls):
     """
-    Launches a real Chromium browser to load pages, execute client-side JS,
-    and extract fully resolved links directly from the browser DOM.
+    Launches a Chromium browser via Playwright to render JavaScript DOM,
+    extract internal links, and match them against target URLs.
     """
     target_map = {clean_url(u): u.strip() for u in target_urls if u.strip()}
     target_cleans = set(target_map.keys())
@@ -40,8 +49,16 @@ def crawl_with_playwright(target_urls, source_urls):
     total_sources = len(source_urls)
 
     with sync_playwright() as p:
-        # Launch real headless browser with desktop user-agent
-        browser = p.chromium.launch(headless=True)
+        # Container-friendly launch flags required for Streamlit Cloud & Docker
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu"
+            ]
+        )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800}
@@ -57,13 +74,13 @@ def crawl_with_playwright(target_urls, source_urls):
             progress_bar.progress((idx + 1) / total_sources)
 
             try:
-                # Load page and wait for DOM network idle / JS execution
-                response = page.goto(source_url, wait_until="domcontentloaded", timeout=20000)
-                time.sleep(1.5)  # Allow client-side JS/hydration to run
+                # Navigate and wait for initial DOM loaded
+                response = page.goto(source_url, wait_until="domcontentloaded", timeout=25000)
+                time.sleep(1.5)  # Brief pause for client-side JS / React hydration
 
                 status_code = response.status if response else "Unknown"
 
-                # Extract resolved links directly from the live browser DOM
+                # Extract resolved links directly from the live rendered browser DOM
                 dom_links = page.evaluate("""() => {
                     return Array.from(document.querySelectorAll('a')).map(a => ({
                         href: a.href,
@@ -79,14 +96,14 @@ def crawl_with_playwright(target_urls, source_urls):
                     raw_href = link["href"]
                     href_clean = clean_url(raw_href)
 
-                    # Match target URL (excluding self-links)
+                    # Match target URL (excluding self-referencing links)
                     if href_clean in target_cleans and href_clean != source_clean:
                         matched_count += 1
                         snippet = link["context"][:160] + "..." if len(link["context"]) > 160 else link["context"]
 
                         inbound_db[href_clean].append({
                             "source_url": source_url,
-                            "anchor_text": link["text"] or "[Image / Empty]",
+                            "anchor_text": link["text"] or "[Image / Empty Anchor]",
                             "raw_href": raw_href,
                             "context_snippet": snippet
                         })
@@ -111,7 +128,7 @@ def crawl_with_playwright(target_urls, source_urls):
     status_text.empty()
     progress_bar.empty()
 
-    # Format output
+    # Format output results
     results = []
     for clean_u, original_u in target_map.items():
         refs = inbound_db[clean_u]
@@ -124,53 +141,59 @@ def crawl_with_playwright(target_urls, source_urls):
 
     return results, audit_logs
 
-# --- Streamlit UI ---
-st.set_page_config(page_title="Playwright Orphan Checker", layout="wide")
+
+# --- Streamlit UI Config & Layout ---
+st.set_page_config(page_title="Orphan Page Checker", layout="wide")
 st.title("🌐 Real-Browser (Playwright) Orphan Checker")
-st.caption("Renders full JavaScript DOM to detect dynamically loaded and client-side rendered links.")
+st.caption("Renders full JavaScript DOM in Chromium to reliably detect dynamic, client-side, and React-rendered internal links.")
 
 col1, col2 = st.columns(2)
 
 with col1:
     user_targets = st.text_area(
         "Target URLs to Check (One per line):",
-        height=160,
+        height=180,
         value="https://www.upfluence.com/platform/feature-find-influencers"
     )
 
 with col2:
     user_sources = st.text_area(
-        "Source Pages to Crawl (One per line):",
-        height=160,
+        "Source Pages to Scan (One per line):",
+        height=180,
         value="https://www.upfluence.com/influencer-marketing/how-to-find-the-perfect-influencers-for-your-niche"
     )
 
-if st.button("Run Browser Check", type="primary"):
+if st.button("Run Orphan Check", type="primary"):
     targets = [t.strip() for t in user_targets.splitlines() if t.strip()]
     sources = [s.strip() for s in user_sources.splitlines() if s.strip()]
 
     if not targets or not sources:
         st.error("Please provide both Target URLs and Source Pages to scan.")
     else:
-        results, audit_logs = crawl_with_playwright(targets, sources)
+        with st.spinner("Running Chromium browser scan..."):
+            results, audit_logs = crawl_with_playwright(targets, sources)
 
-        # Metrics Overview
+        # Overview Metrics
         orphans = sum(1 for r in results if r["is_orphan"] == "Yes")
         m1, m2, m3 = st.columns(3)
         m1.metric("Target URLs Checked", len(results))
-        m2.metric("Orphan Pages", orphans)
-        m3.metric("Linked Pages", len(results) - orphans)
+        m2.metric("Orphan Pages Detected", orphans)
+        m3.metric("Linked Pages Found", len(results) - orphans)
 
         st.markdown("---")
-        st.subheader("Results Table")
+        st.subheader("Results Overview")
 
         df = pd.DataFrame([
-            {"Target URL": r["target_url"], "Is Orphan?": r["is_orphan"], "Inbound Links Found": r["inbound_count"]}
+            {
+                "Target URL": r["target_url"],
+                "Is Orphan?": r["is_orphan"],
+                "Inbound Links Found": r["inbound_count"]
+            }
             for r in results
         ])
         st.dataframe(df, use_container_width=True)
 
-        st.markdown("### Verified Inbound Link Evidence")
+        st.markdown("### Inbound Link Evidence")
         for item in results:
             if item["is_orphan"] == "No":
                 with st.expander(f"🟢 LINKED ({item['inbound_count']} links found) — {item['target_url']}"):
@@ -182,8 +205,8 @@ if st.button("Run Browser Check", type="primary"):
                         st.divider()
             else:
                 with st.expander(f"🔴 ORPHAN — {item['target_url']}"):
-                    st.warning("No incoming links detected in the rendered browser DOM across the scanned pages.")
+                    st.warning("No incoming links detected in the rendered browser DOM across the scanned source pages.")
 
         st.markdown("---")
-        with st.expander("🔍 Browser Crawl Audit Log"):
+        with st.expander("🔍 Browser Crawl Diagnostic Log"):
             st.dataframe(pd.DataFrame(audit_logs), use_container_width=True)
