@@ -9,14 +9,12 @@ from playwright.sync_api import sync_playwright
 # --- Streamlit Cloud Auto-Installation ---
 @st.cache_resource
 def setup_playwright():
-    """Ensure Playwright Chromium browser and system dependencies are installed on Cloud boot."""
+    """Installs Chromium binary on app launch (OS dependencies handled by packages.txt)."""
     try:
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-        subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"], check=True)
     except Exception as e:
-        print(f"Playwright setup info: {e}")
+        print(f"Playwright installation warning: {e}")
 
-# Run setup at application launch
 setup_playwright()
 
 
@@ -49,14 +47,15 @@ def crawl_with_playwright(target_urls, source_urls):
     total_sources = len(source_urls)
 
     with sync_playwright() as p:
-        # Container-friendly launch flags required for Streamlit Cloud & Docker
+        # Container-friendly launch flags required for Streamlit Cloud
         browser = p.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu"
+                "--disable-gpu",
+                "--single-process"
             ]
         )
         context = browser.new_context(
@@ -74,13 +73,11 @@ def crawl_with_playwright(target_urls, source_urls):
             progress_bar.progress((idx + 1) / total_sources)
 
             try:
-                # Navigate and wait for initial DOM loaded
                 response = page.goto(source_url, wait_until="domcontentloaded", timeout=25000)
-                time.sleep(1.5)  # Brief pause for client-side JS / React hydration
+                time.sleep(1.5)
 
                 status_code = response.status if response else "Unknown"
 
-                # Extract resolved links directly from the live rendered browser DOM
                 dom_links = page.evaluate("""() => {
                     return Array.from(document.querySelectorAll('a')).map(a => ({
                         href: a.href,
@@ -96,7 +93,6 @@ def crawl_with_playwright(target_urls, source_urls):
                     raw_href = link["href"]
                     href_clean = clean_url(raw_href)
 
-                    # Match target URL (excluding self-referencing links)
                     if href_clean in target_cleans and href_clean != source_clean:
                         matched_count += 1
                         snippet = link["context"][:160] + "..." if len(link["context"]) > 160 else link["context"]
@@ -128,7 +124,6 @@ def crawl_with_playwright(target_urls, source_urls):
     status_text.empty()
     progress_bar.empty()
 
-    # Format output results
     results = []
     for clean_u, original_u in target_map.items():
         refs = inbound_db[clean_u]
@@ -145,7 +140,7 @@ def crawl_with_playwright(target_urls, source_urls):
 # --- Streamlit UI Config & Layout ---
 st.set_page_config(page_title="Orphan Page Checker", layout="wide")
 st.title("🌐 Real-Browser (Playwright) Orphan Checker")
-st.caption("Renders full JavaScript DOM in Chromium to reliably detect dynamic, client-side, and React-rendered internal links.")
+st.caption("Renders full JavaScript DOM in Chromium to reliably detect dynamic internal links.")
 
 col1, col2 = st.columns(2)
 
@@ -171,42 +166,46 @@ if st.button("Run Orphan Check", type="primary"):
         st.error("Please provide both Target URLs and Source Pages to scan.")
     else:
         with st.spinner("Running Chromium browser scan..."):
-            results, audit_logs = crawl_with_playwright(targets, sources)
+            try:
+                results, audit_logs = crawl_with_playwright(targets, sources)
 
-        # Overview Metrics
-        orphans = sum(1 for r in results if r["is_orphan"] == "Yes")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Target URLs Checked", len(results))
-        m2.metric("Orphan Pages Detected", orphans)
-        m3.metric("Linked Pages Found", len(results) - orphans)
+                orphans = sum(1 for r in results if r["is_orphan"] == "Yes")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Target URLs Checked", len(results))
+                m2.metric("Orphan Pages Detected", orphans)
+                m3.metric("Linked Pages Found", len(results) - orphans)
 
-        st.markdown("---")
-        st.subheader("Results Overview")
+                st.markdown("---")
+                st.subheader("Results Overview")
 
-        df = pd.DataFrame([
-            {
-                "Target URL": r["target_url"],
-                "Is Orphan?": r["is_orphan"],
-                "Inbound Links Found": r["inbound_count"]
-            }
-            for r in results
-        ])
-        st.dataframe(df, use_container_width=True)
+                df = pd.DataFrame([
+                    {
+                        "Target URL": r["target_url"],
+                        "Is Orphan?": r["is_orphan"],
+                        "Inbound Links Found": r["inbound_count"]
+                    }
+                    for r in results
+                ])
+                st.dataframe(df, use_container_width=True)
 
-        st.markdown("### Inbound Link Evidence")
-        for item in results:
-            if item["is_orphan"] == "No":
-                with st.expander(f"🟢 LINKED ({item['inbound_count']} links found) — {item['target_url']}"):
-                    for ref in item["references"]:
-                        st.markdown(f"**Source Page:** [{ref['source_url']}]({ref['source_url']})")
-                        st.markdown(f"- **Anchor Text:** `{ref['anchor_text']}`")
-                        st.markdown(f"- **Full Target Href:** `{ref['raw_href']}`")
-                        st.markdown(f"- **Surrounding DOM Text:** *\"{ref['context_snippet']}\"*")
-                        st.divider()
-            else:
-                with st.expander(f"🔴 ORPHAN — {item['target_url']}"):
-                    st.warning("No incoming links detected in the rendered browser DOM across the scanned source pages.")
+                st.markdown("### Inbound Link Evidence")
+                for item in results:
+                    if item["is_orphan"] == "No":
+                        with st.expander(f"🟢 LINKED ({item['inbound_count']} links found) — {item['target_url']}"):
+                            for ref in item["references"]:
+                                st.markdown(f"**Source Page:** [{ref['source_url']}]({ref['source_url']})")
+                                st.markdown(f"- **Anchor Text:** `{ref['anchor_text']}`")
+                                st.markdown(f"- **Full Target Href:** `{ref['raw_href']}`")
+                                st.markdown(f"- **Surrounding DOM Text:** *\"{ref['context_snippet']}\"*")
+                                st.divider()
+                    else:
+                        with st.expander(f"🔴 ORPHAN — {item['target_url']}"):
+                            st.warning("No incoming links detected in the rendered browser DOM across the scanned source pages.")
 
-        st.markdown("---")
-        with st.expander("🔍 Browser Crawl Diagnostic Log"):
-            st.dataframe(pd.DataFrame(audit_logs), use_container_width=True)
+                st.markdown("---")
+                with st.expander("🔍 Browser Crawl Diagnostic Log"):
+                    st.dataframe(pd.DataFrame(audit_logs), use_container_width=True)
+
+            except Exception as err:
+                st.error(f"Chromium Launch Error: {err}")
+                st.info("If this is your first deploy after adding packages.txt, please Reboot your app from the Streamlit Cloud menu.")
